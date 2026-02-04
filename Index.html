@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>ALMOST — Prototype</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  // --- HiDPI canvas ---
+  function resize() {
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // --- Game state ---
+  const state = {
+    running: true,
+    score: 0,
+    best: 0,
+    lastMissPx: null,
+    // difficulty
+    speed: 260,          // px/s world scroll
+    speedRamp: 8,        // speed increase per gate
+    gateGap: 200,        // initial gap size
+    gapMin: 120,
+    gapShrink: 1.5,      // shrink per gate
+    gateW: 70,
+    gateSpacing: 320,
+    // proximity thresholds (px)
+    closePx: 18,
+    almostPx: 8,
+    // feedback
+    flash: 0,
+    shake: 0,
+  };
+
+  // player
+  const player = {
+    x: 140,
+    y: 200,
+    r: 14,
+    dash: 54,          // fixed micro-dash distance
+    dashDir: -1,       // alternates: -1 up, +1 down
+  };
+
+  // gates list
+  let gates = [];
+  let nextGateX = 0;
+  let worldX = 0;
+
+  // timing
+  let lastT = performance.now();
+
+  // --- Utility ---
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function reset() {
+    state.running = true;
+    state.score = 0;
+    state.lastMissPx = null;
+    state.speed = 260;
+    state.gateGap = Math.min(220, Math.max(state.gateGap, 200));
+    state.flash = 0;
+    state.shake = 0;
+
+    player.y = window.innerHeight * 0.5;
+    player.dashDir = -1;
+
+    gates = [];
+    worldX = 0;
+    nextGateX = window.innerWidth + 250;
+    for (let i = 0; i < 6; i++) spawnGate();
+  }
+
+  function spawnGate() {
+    const H = window.innerHeight;
+    const gap = clamp(state.gateGap, state.gapMin, 9999);
+    const margin = 70;
+    const gapY = margin + Math.random() * (H - margin * 2 - gap);
+
+    gates.push({
+      x: nextGateX,
+      gapY,
+      gapH: gap,
+      passed: false,
+      color: pickNeon(),
+    });
+    nextGateX += state.gateSpacing;
+  }
+
+  // simple neon palette
+  function pickNeon() {
+    const colors = ['#2cffc7', '#7c5cff', '#ff3d81', '#ffd54a', '#4ad7ff'];
+    return colors[(Math.random() * colors.length) | 0];
+  }
+
+  // --- Input: one action ---
+  function action() {
+    if (!state.running) { reset(); return; }
+
+    // alternate dash direction to keep 1-button skill
+    player.y += player.dashDir * player.dash;
+    player.dashDir *= -1;
+
+    // clamp to screen
+    player.y = clamp(player.y, player.r + 10, window.innerHeight - player.r - 10);
+  }
+
+  window.addEventListener('pointerdown', (e) => { e.preventDefault(); action(); }, { passive:false });
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
+  });
+
+  // --- Collision helpers ---
+  function circleRectHit(cx, cy, r, rx, ry, rw, rh) {
+    const nx = clamp(cx, rx, rx + rw);
+    const ny = clamp(cy, ry, ry + rh);
+    const dx = cx - nx, dy = cy - ny;
+    return (dx*dx + dy*dy) <= r*r;
+  }
+
+  function endRun(missPx) {
+    state.running = false;
+    state.best = Math.max(state.best, state.score);
+    state.lastMissPx = missPx;
+    state.flash = 0.25;
+    state.shake = 10;
+  }
+
+  // proximity scoring when passing gate
+  function scoreGateProximity(g) {
+    // distance from player edge to nearest gate edge at the gap line
+    const topEdge = g.gapY;            // y where top pipe ends
+    const botEdge = g.gapY + g.gapH;   // y where bottom pipe starts
+    const distToTop = Math.abs((player.y - player.r) - topEdge);
+    const distToBot = Math.abs(botEdge - (player.y + player.r));
+    const missPx = Math.min(distToTop, distToBot);
+
+    // Award tiers (smaller miss = closer)
+    if (missPx <= state.almostPx) {
+      state.score += 3;
+      state.flash = 0.08;
+      state.shake = 6;
+    } else if (missPx <= state.closePx) {
+      state.score += 2;
+    } else {
+      state.score += 1;
+    }
+
+    // ramp difficulty
+    state.speed += state.speedRamp;
+    state.gateGap = Math.max(state.gapMin, state.gateGap - state.gapShrink);
+  }
+
+  // --- Main loop ---
+  function tick(t) {
+    const dt = Math.min(0.033, (t - lastT) / 1000);
+    lastT = t;
+
+    update(dt);
+    render(dt);
+
+    requestAnimationFrame(tick);
+  }
+
+  function update(dt) {
+    // decay effects
+    state.flash = Math.max(0, state.flash - dt);
+    state.shake = Math.max(0, state.shake - dt * 30);
+
+    if (!state.running) return;
+
+    // scroll world
+    worldX += state.speed * dt;
+
+    // move gates left
+    for (const g of gates) g.x -= state.speed * dt;
+
+    // spawn / cull
+    while (gates.length && gates[0].x < -state.gateW - 50) gates.shift();
+    while (gates.length < 7) spawnGate();
+
+    // collision & pass scoring
+    for (const g of gates) {
+      const rx = g.x, rw = state.gateW;
+
+      // top rect
+      const topRect = { x: rx, y: 0, w: rw, h: g.gapY };
+      // bottom rect
+      const botRect = { x: rx, y: g.gapY + g.gapH, w: rw, h: window.innerHeight - (g.gapY + g.gapH) };
+
+      // hit
+      if (circleRectHit(player.x, player.y, player.r, topRect.x, topRect.y, topRect.w, topRect.h) ||
+          circleRectHit(player.x, player.y, player.r, botRect.x, botRect.y, botRect.w, botRect.h)) {
+
+        // compute "miss" as overlap-ish: how close you were at the moment of hit
+        // If hit top, use distance to topEdge; if hit bottom, distance to bottomEdge.
+        const topEdge = g.gapY;
+        const botEdge = g.gapY + g.gapH;
+
+        const distToTop = Math.abs((player.y - player.r) - topEdge);
+        const distToBot = Math.abs(botEdge - (player.y + player.r));
+        const missPx = Math.min(distToTop, distToBot);
+
+        endRun(missPx);
+        return;
+      }
+
+      // pass line: when gate passes player x
+      if (!g.passed && (g.x + rw) < player.x) {
+        g.passed = true;
+        scoreGateProximity(g);
+      }
+    }
+  }
+
+  function render() {
+    const W = window.innerWidth, H = window.innerHeight;
+
+    // screen shake
+    let sx = 0, sy = 0;
+    if (state.shake > 0) {
+      sx = (Math.random() - 0.5) * state.shake;
+      sy = (Math.random() - 0.5) * state.shake;
+    }
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    // background
+    ctx.fillStyle = '#0b0b10';
+    ctx.fillRect(-50, -50, W + 100, H + 100);
+
+    // subtle stars
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = '#ffffff';
+    for (let i = 0; i < 60; i++) {
+      const x = (i * 157) % W;
+      const y = (i * 271) % H;
+      ctx.fillRect(x, y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // draw gates
+    for (const g of gates) {
+      ctx.fillStyle = g.color;
+      // top
+      ctx.fillRect(g.x, 0, state.gateW, g.gapY);
+      // bottom
+      ctx.fillRect(g.x, g.gapY + g.gapH, state.gateW, H - (g.gapY + g.gapH));
+
+      // inner glow line
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(g.x + state.gateW - 6, 0, 2, g.gapY);
+      ctx.fillRect(g.x + state.gateW - 6, g.gapY + g.gapH, 2, H - (g.gapY + g.gapH));
+      ctx.globalAlpha = 1;
+    }
+
+    // player
+    ctx.fillStyle = '#f2f2f5';
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // HUD
+    ctx.fillStyle = '#f2f2f5';
+    ctx.font = '600 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(`Score: ${state.score}`, 18, 34);
+
+    ctx.globalAlpha = 0.75;
+    ctx.font = '500 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(`Best: ${state.best}`, 18, 56);
+    ctx.globalAlpha = 1;
+
+    // Instructions / Game Over
+    if (state.running) {
+      ctx.globalAlpha = 0.7;
+      ctx.font = '500 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap / Click / Space = micro-dash (alternates up/down)', 18, H - 20);
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.globalAlpha = 0.95;
+      ctx.font = '800 54px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('ALMOST', 18, H * 0.35);
+
+      ctx.globalAlpha = 0.85;
+      ctx.font = '700 26px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      const miss = (state.lastMissPx == null) ? '' : `Missed by ${Math.max(0, state.lastMissPx).toFixed(1)} px`;
+      ctx.fillText(miss, 18, H * 0.35 + 46);
+
+      ctx.globalAlpha = 0.85;
+      ctx.font = '600 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap to retry', 18, H * 0.35 + 80);
+      ctx.globalAlpha = 1;
+    }
+
+    // flash overlay for "ALMOST"
+    if (state.flash > 0) {
+      ctx.globalAlpha = clamp(state.flash * 3.5, 0, 0.35);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-50, -50, W + 100, H + 100);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  reset();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
